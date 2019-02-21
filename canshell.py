@@ -1,31 +1,61 @@
 #!/usr/bin/env python2.7
 
-import readline, sys, cmd
-from panda import Panda
-import re
+import readline, sys, time
+import cmd
+import pyparsing as pp
 import binascii
+from panda import Panda
 
 readline.parse_and_bind('tab: complete')
 
-def recv():
-    return random.randint(0, 100)
-
-def tokenize(s):
-    tokens = []
-    for t in re.split('[, ]', s):
-        t = t.strip()
-        if t: tokens.append(t)
-    return tokens;
+def _parse_ids(args):
+    if not args: return None
+    hexs = pp.Combine(pp.Literal("0x") + pp.Word(pp.hexnums))    
+    id = hexs('ids*')
+    grammar = id + pp.ZeroOrMore(pp.Optional(",") + id)
+    r = grammar.parseString(args, parseAll=True)
+    return [ int(i,16) for i in r.ids] 
 
 def format(id, data, bus):
     return "0x%x, 0x%s, %i" % (id, binascii.hexlify(data), bus)
 
-class canwatch(cmd.Cmd):
+def _parse_discover_args(args):
+    if not args.strip():
+        return (None,[])
+    hexs = pp.Combine(pp.Literal("0x") + pp.Word(pp.hexnums))
+    id = hexs('ids*')
+    grammar = (id + pp.ZeroOrMore(pp.Optional(",") + id)) + pp.Optional(pp.Literal("mask") + hexs('mask'))
+    r = grammar.parseString(args, parseAll=True)
+    ids = [ int(i, 16) for i in r.ids ]
+    mask = []
+    if r.mask:
+        mask = bytearray.fromhex(r.mask[2:])
+    return (ids,mask)
 
-    #intro = "Canwatch, Ctrl-D to quit"
+def _parse_send_args(args):
+    hexs = pp.Combine(pp.Literal("0x") + pp.Word(pp.hexnums))
+    msg = (hexs + pp.Suppress(",") + hexs + pp.Suppress(",") + pp.Word(pp.nums))("msgs*")
+    grammar = pp.OneOrMore(msg) + pp.Optional(pp.Literal("freq") + pp.Word(pp.nums)('freq'))
+    r = grammar.parseString(args, parseAll=True)
+    msgs = [ (int(id,16), bytearray.fromhex(data[2:]), int(bus)) for (id,data,bus) in r.msgs ]
+    freq = None
+    if r.freq: freq = float(r.freq)
+    return (msgs, freq)
+    
+class canshell(cmd.Cmd):
+
     prompt = '> '
 
     def __init__(self):
+
+        print "Panda/CanBus shell:"
+        print "Ctrl-C - interrupt running command"
+        print "Ctrl-D - exit canshell"
+        print (" ! <expr> - evaluate python expression")
+        print (" help - list commands")
+        print (" help <command> - command help")
+        print ("")
+
         cmd.Cmd.__init__(self)
         self.__baseline__ = set()
         self.__ignore__ = set()
@@ -50,12 +80,24 @@ class canwatch(cmd.Cmd):
     def do_EOF(self, args):
         sys.exit(0)
 
+    def do_shell(self, args):
+        "Evaluate Python expression."
+        panda = self.panda
+        def send(id, msg, bus): panda.can_send(id, msg, bus)
+        def recv(): return panda.can_recv()
+        print eval(args)
+        
+    def do_clear(self, args):
+        "clear panda buffer, requires int arg"
+        self.panda.can_clear(int(args))
+        
     def do_safety(self, args):
+        "set panda safety level"
         s = eval("Panda.SAFETY_%s" % args.upper())
         self.panda.set_safety_mode(s)
 
     def complete_safety(self, text, line, begidx, endidx):
-        return [
+        v = [
             "NOOUTPUT",
             "HONDA",
             "TOYOTA",
@@ -71,8 +113,11 @@ class canwatch(cmd.Cmd):
             "ALLOUTPUT",
             "ELM327",
         ]
+        k = line[begidx:endidx].upper()
+        return [ s for s in v if s.startswith(k) ]
         
     def do_baseline(self, args):
+        "record baseline ignored in recv"
         while True:
             msgs = self.panda.can_recv()
             for (id, _, dat, src) in msgs:
@@ -80,23 +125,19 @@ class canwatch(cmd.Cmd):
                 self.__baseline__.add(msg)
 
     def do_ignore(self, args):
-        for a in tokenize(args):
-            try:
-                self.__ignore__.add(int(a, 16))
-            except Exception, e: print e
-
-    def _parse_discover_args(self, args):
-        args = args.lower().split(" mask ", 1)
-        ids = None
-        mask = []
-        if args:
-            ids = set([ int(a, 16) for a in tokenize(args[0]) ])
-        if len(args) == 2:
-            mask = bytearray.fromhex(args[1].strip()[2:])
-        return (ids,mask)
+        "ignore given ids in recv"
+        for a in _parse_ids(args):
+            self.__ignore__.add(a)
             
     def do_discover(self, args):
-        (ids,mask) = self._parse_discover_args(args)
+        """
+        discover unique ids or messages with optional hex mask
+        Examples:
+          discover
+          discover 0x152
+          discover 0x152 mask 0x0f0f
+        """
+        (ids,mask) = _parse_discover_args(args)
         seen = set()
         while True:
             msgs = self.panda.can_recv()
@@ -114,9 +155,17 @@ class canwatch(cmd.Cmd):
                     if id in seen: continue
                     print (hex(id))
                     seen.add(id)
-            
+
     def do_recv(self, args):
-        ids = set([ int(a, 16) for a in tokenize(args) ])
+        """
+        recv from any or from given address(es)
+        Examples:
+          recv
+          recv 0x152
+          recv 0x374,0x374
+        """
+        
+        ids = _parse_ids(args)
         while True:
             msgs = self.panda.can_recv()
             for (id, _, data, src) in msgs:
@@ -125,15 +174,25 @@ class canwatch(cmd.Cmd):
                     if (id, data, src) in self.__baseline__: continue
                 else:
                     if not id in ids: continue
-                print (format(id, binascii.hexlify(data), src))
+                print (format(id, data, src))
 
     def do_send(self, args):
-        (id, data, bus) = tokenize(args)
-        id = int(id,16)
-        data = bytearray.fromhex(data.strip()[2:])
-        bus = int(bus)
-        #print (format(id, binascii.hexlify(data), bus))
-        self.panda.can_send(id,data,bus)
+        """
+        send one or more messages once or with given frequency
+        Examples:
+          send 0x375,0xffffffffffffffff,0
+          send 0x375,0xffffffffffffffff,0 0x375,0x0000000000000000,0
+          send 0x375,0xffffffffffffffff,0 freq 10
+        """
+        (msgs, freq) = _parse_send_args(args)
+        while True:
+            for (id,data,bus) in msgs:
+                #print (format(id, data, bus))
+                self.panda.can_send(id, data, bus)
+            if freq:
+                time.sleep(1.0/freq)
+                continue
+            break
 
     def onecmd(self, line):
         try:
@@ -162,4 +221,4 @@ class canwatch(cmd.Cmd):
 
 
 if __name__ == '__main__':
-    canwatch().cmdloop()
+    canshell().cmdloop()
